@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gearbox Graph</title>
+<style>
+  :root { --bg:#17191b; --panel:#222528ee; --ink:#e8e6e1; --dim:#9a9d9f; --line:#3a3e42; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow:hidden; }
+  canvas { display:block; cursor:grab; }
+  canvas.dragging { cursor:grabbing; }
+  #panel { position:fixed; top:12px; left:12px; width:250px; max-height:calc(100% - 24px); overflow:auto;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  h1 { font-size:15px; margin:0 0 2px; letter-spacing:.2px; cursor:pointer; user-select:none; }
+  h1::after { content:' ▾'; color:var(--dim); }
+  #panel.min h1::after { content:' ▸'; }
+  #panel.min > :not(h1) { display:none; }
+  #panel.min { width:auto; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:10px; }
+  .seg { display:flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; margin-bottom:10px; }
+  .seg button { flex:1; background:transparent; color:var(--dim); border:0; padding:6px 0; font:inherit; cursor:pointer; }
+  .seg button.on { background:#3a3e42; color:var(--ink); }
+  input[type=search] { width:100%; padding:6px 8px; border-radius:6px; border:1px solid var(--line);
+    background:#15171a; color:var(--ink); font:inherit; margin-bottom:10px; }
+  .row { display:flex; align-items:center; gap:8px; padding:3px 0; cursor:pointer; user-select:none; }
+  .row.off { opacity:.35; }
+  .sw { width:16px; height:12px; border-radius:2px; flex:none; box-shadow: inset -2px -2px 0 rgba(0,0,0,.25); }
+  .row .n { margin-left:auto; color:var(--dim); font-variant-numeric: tabular-nums; }
+  .sep { border-top:1px solid var(--line); margin:10px 0; }
+  label.chk { display:flex; gap:8px; align-items:center; cursor:pointer; margin-bottom:4px; }
+  .sizes { color:var(--dim); font-size:12px; margin-top:8px; }
+  #tip { position:fixed; pointer-events:none; background:#0e0f10f0; border:1px solid var(--line);
+    border-radius:8px; padding:7px 9px; max-width:340px; display:none; }
+  #tip b { display:block; } #tip span { color:var(--dim); font-size:12px; word-break:break-all; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <h1 id="ttl">Gearbox Graph</h1>
+  <div class="sub" id="stats"></div>
+  <div class="seg"><button id="mGears" class="on">Gears</button><button id="mBrick">Bricks</button></div>
+  <div class="seg"><button id="lMach" class="on">Machine</button><button id="lProj">By project</button><button id="lWeb">Web</button></div>
+  <input type="search" id="q" placeholder="Find a note…">
+  <div id="legend"></div>
+  <div class="sep"></div>
+  <label class="chk"><input type="checkbox" id="orph"> Show loose parts (unlinked notes)</label>
+  <label class="chk" id="allRow"><input type="checkbox" id="all"> Show every link (rubber bands)</label>
+  <label class="chk" id="spinRow"><input type="checkbox" id="spin" checked> Spin the gears</label>
+  <div class="sizes" id="sizes"></div>
+  <div class="sizes">Drag to pan · drag a gear to crank it · scroll to zoom · click a part to open it in Obsidian</div>
+</div>
+<div id="tip"></div>
+<script>
+const DATA = /*__DATA__*/null;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const U = 10; // one stud / one beam-hole pitch, in world units
+const TAU = Math.PI*2;
+const INDEX_RE = /(^|[\s_-])index$/i;   // notes named "...Index", e.g. "Projects-INDEX" or "Reading index"
+let W, H, DPR;
+function resize(){ DPR = window.devicePixelRatio||1; W = innerWidth; H = innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR; cv.style.width = W+'px'; cv.style.height = H+'px'; kick(); }
+
+// ---- nodes: pick a brick and a machine part for each note by link count ----
+const N = DATA.nodes.map((n,i)=>({...n, i, deg:0, x:0, y:0, vx:0, vy:0, nb:[], dir:1}));
+for (const [a,b] of DATA.edges){ N[a].deg++; N[b].deg++; N[a].nb.push(b); N[b].nb.push(a); }
+for (const n of N){
+  const d = n.deg;
+  // brick
+  if (d===0){ n.cols=1; n.rows=1; n.round=true; }
+  else if (d<=3){ n.cols=2; n.rows=1; }
+  else if (d<=11){ n.cols=2; n.rows=2; }
+  else { n.cols=4; n.rows=2; }
+  n.w = n.cols*U; n.h = n.rows*U;
+  // gears mode: a machine part, shaped by how the note is linked
+  if (d===0) n.part = 'pin';
+  else if (INDEX_RE.test(n.t)) n.part = 'turn';           // index notes: everything pivots on them
+  else if (d===1){ n.part = 'beam'; n.holes = 3; }        // 3-hole beam, pointing at its one link
+  else if (d===2) n.part = 'conn';                        // angled connector, snapped to the angle of its links
+  else if (d===3) n.part = 'tee';                         // T-shaped beam 3x3
+  else if (d<=5) n.part = 'hub';                          // axle connector hub with 4 bars
+  else { n.part = 'gear'; n.T = d<=11 ? 16 : d<=19 ? 24 : d<=39 ? 40 : 64; n.R = n.T/16*1.5*U; }
+  n.tr = { gear: (n.R||0)+0.3*U, beam: 1.5*U, conn: 1.6*U, tee: 2.6*U, hub: 1.6*U, turn: 4.25*U, pin: U }[n.part];
+  n.r = Math.max(n.tr, Math.hypot(n.w,n.h)/2);                               // layout radius fits both
+  n.color = DATA.groups[n.g].color;
+}
+const linked = N.filter(n=>n.deg>0), loose = N.filter(n=>n.deg===0);
+// Neighbouring gears turn opposite ways: 2-colour the graph breadth-first.
+{ const seen = new Set();
+  for (const s of linked){ if (seen.has(s.i)) continue; seen.add(s.i); const q = [s];
+    while (q.length){ const n = q.shift();
+      for (const j of n.nb) if (!seen.has(j)){ seen.add(j); N[j].dir = -n.dir; q.push(N[j]); } } } }
+const groupOn = Object.fromEntries(Object.keys(DATA.groups).map(k=>[k,true]));
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let mode = 'gears', spin = !reduceMotion, showLoose = false, query = '', hover = null;
+document.getElementById('spin').checked = spin;
+
+// ---- machine layout: one real gear train, every other part on a straight axle ----
+// Gears mesh along a spanning tree of the gear-to-gear links: centre distance = sum of pitch radii,
+// speed ratio = tooth ratio, tooth phase set so teeth sit in gaps. The other parts plug into gears on
+// axles, spread evenly round each gear's open side. Links left out of the tree are rubber bands, shown on demand.
+let layout = 'machine', showAll = false;
+const key = (a,b)=> a<b ? a+','+b : b+','+a;
+let tree = new Set(), meshed = new Set(), labels = [];
+const angDiff = (a,b)=>{ const d = Math.abs(((a-b)%TAU+TAU)%TAU); return Math.min(d, TAU-d); };
+function segDist(px,py,x1,y1,x2,y2){ const dx = x2-x1, dy = y2-y1, L2 = dx*dx+dy*dy||1;
+  const k = Math.max(0, Math.min(1, ((px-x1)*dx+(py-y1)*dy)/L2)); return Math.hypot(px-x1-k*dx, py-y1-k*dy); }
+// shelf-pack boxes {w,h} left to right in rows no wider than maxW; sets b.px, b.py, returns [width, height]
+function shelf(boxes, gap, maxW){ let x = 0, y = 0, rowH = 0, W = 0;
+  for (const b of boxes){ if (x > 0 && x + b.w > maxW){ x = 0; y += rowH + gap; rowH = 0; }
+    b.px = x; b.py = y; x += b.w + gap; rowH = Math.max(rowH, b.h); W = Math.max(W, b.px + b.w); }
+  return [W, y + rowH]; }
+// perProject: only links inside a project group build a machine, one table-full of separate builds;
+// links between projects become rubber bands. Returns the build so the page can switch between them.
+function machineLayout(perProject){
+  tree = new Set(); meshed = new Set(); labels = [];
+  const nbOf = n => perProject ? n.nb.filter(j=>N[j].g===n.g) : n.nb;
+  for (const n of N){ n.tp = null; n.tnb = []; n.done = false; n.out = null; }
+  const comps = [], seen = new Set();
+  for (const s of linked){ if (seen.has(s.i)) continue; seen.add(s.i); const c = [s];
+    for (let k=0;k<c.length;k++) for (const j of nbOf(c[k])) if (!seen.has(j)){ seen.add(j); c.push(N[j]); }
+    comps.push(c); }
+  comps.sort((a,b)=>b.length-a.length);
+  let shiftX = null;
+  for (const comp of comps){
+    const placed = [];
+    const free = (x,y,r,p,thru)=>{ for (const m of placed){ if (m===p) continue; const need = r+m.r+2;
+        if ((x-m.x)**2+(y-m.y)**2 < need*need) return false;
+        if (p && !thru && segDist(m.x,m.y,p.x,p.y,x,y) < m.r*0.8) return false; }   // the axle can't run through a part
+      return true; };
+    const put = (n,x,y,p,mesh)=>{ n.x = x; n.y = y; n.done = true; placed.push(n);
+      if (!p) return; n.tp = p; n.out = Math.atan2(y-p.y, x-p.x); n.tnb.push(p.i); p.tnb.push(n.i);
+      tree.add(key(n.i,p.i)); if (mesh) meshed.add(key(n.i,p.i)); };
+    const pref = (p,k,cnt)=> p.out==null ? k*TAU/cnt : p.out + ((k+.5)/cnt-.5)*Math.PI;  // fan children outward
+    const tryMesh = (c,p,want)=>{ const D = p.R+c.R; let best = null, bs = Infinity;
+      for (let k=0;k<72;k++){ const a = k*TAU/72, x = p.x+Math.cos(a)*D, y = p.y+Math.sin(a)*D, sc = angDiff(a,want);
+        if (sc < bs && free(x,y,c.r,p)){ best = [x,y]; bs = sc; } }
+      return best; };
+    // shortest whole-stud axle near the wanted direction; if every route crosses a part, allow crossing
+    const tryAxle = (c,p,want,dirs,thru)=>{ const L0 = Math.ceil((p.r+c.r+U)/U)*U, lpk = dirs > 16 ? 0.05 : 0.12;
+      let best = null, bs = Infinity;
+      for (let L=L0; L<L0+40*U; L+=U){ const lp = (L-L0)/U*lpk; if (lp >= bs) break;
+        for (let k=0;k<dirs;k++){ const a = k*TAU/dirs, sc = angDiff(a,want)+lp; if (sc >= bs) continue;
+          const x = p.x+Math.cos(a)*L, y = p.y+Math.sin(a)*L; if (free(x,y,c.r,p,thru)){ best = [x,y]; bs = sc; } } }
+      return best || (thru ? [p.x+Math.cos(want)*(L0+40*U), p.y+Math.sin(want)*(L0+40*U)] : tryAxle(c,p,want,dirs,true)); };
+    const byDeg = (a,b)=>b.deg-a.deg || a.i-b.i;
+    const root = comp.filter(c=>c.part==='gear').sort(byDeg)[0] || [...comp].sort(byDeg)[0]; put(root,0,0,null,false);
+    // 1. the gear train, breadth-first from the busiest gear, meshes only
+    if (root.part==='gear') for (let q=0; q<placed.length; q++){ const p = placed[q];
+      const kids = nbOf(p).map(j=>N[j]).filter(c=>c.part==='gear' && !c.done).sort(byDeg);
+      kids.forEach((c,k)=>{ const at = tryMesh(c,p,pref(p,k,kids.length)); if (at) put(c,at[0],at[1],p,true); }); }
+    // 2. parts that plug straight into gears. One linked to several gears goes to the gear with the most
+    // open room; each gear's parts sit on evenly spaced spokes across its open arc, sorted by project.
+    const gears = placed.filter(g=>g.part==='gear');
+    for (const g of gears){ g.openA = []; g.load = [];
+      for (let k=0;k<72;k++){ const a = k*TAU/72, x = g.x+Math.cos(a)*(g.R+4*U), y = g.y+Math.sin(a)*(g.R+4*U);
+        if (free(x,y,1.5*U,g)) g.openA.push(a); } }
+    const plug = comp.filter(c=>!c.done && nbOf(c).some(j=>N[j].done && N[j].part==='gear'))
+      .map(c=>[c, nbOf(c).map(j=>N[j]).filter(g=>g.done && g.part==='gear')]).sort((a,b)=>a[1].length-b[1].length || byDeg(a[0],b[0]));
+    for (const [c,hosts] of plug){ let h = hosts[0], hs = Infinity;
+      for (const g of hosts){ const sc = (g.load.length+1)/(g.openA.length+1); if (sc < hs){ hs = sc; h = g; } }
+      h.load.push(c); }
+    for (const g of [...gears].sort((a,b)=>b.load.length-a.load.length)){
+      const P = g.load.sort((a,b)=>a.g.localeCompare(b.g) || b.deg-a.deg || a.t.localeCompare(b.t)), A = g.openA.length ? g.openA : [0];
+      let s0 = 0; for (let k=0;k<A.length;k++) if (angDiff(A[k], A[(k+1)%A.length]) > TAU/72*1.5){ s0 = (k+1)%A.length; break; } // start at a gap
+      P.forEach((c,k)=>{ const want = A[(s0 + Math.floor((k+.5)*A.length/P.length)) % A.length];
+        const [x,y] = tryAxle(c,g,want,144); put(c,x,y,g,false); }); }
+    // 3. everything left, breadth-first: gears that couldn't mesh above, and parts linked only to parts
+    for (let q=0; q<placed.length; q++){ const p = placed[q];
+      const kids = nbOf(p).map(j=>N[j]).filter(c=>!c.done).sort(byDeg);
+      kids.forEach((c,k)=>{ const want = pref(p,k,kids.length);
+        const at = c.part==='gear' && p.part==='gear' ? tryMesh(c,p,want) : null;
+        if (at) put(c,at[0],at[1],p,true); else { const [x,y] = tryAxle(c,p,want,16); put(c,x,y,p,false); } }); }
+    let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    for (const n of comp){ x0=Math.min(x0,n.x-n.r); y0=Math.min(y0,n.y-n.r); x1=Math.max(x1,n.x+n.r); y1=Math.max(y1,n.y+n.r); }
+    comp.box = {x0, y0, w:x1-x0, h:y1-y0};
+    if (perProject) continue;
+    // small separate machines go in a row to the right of the big one
+    if (shiftX===null) shiftX = x1 + 6*U; else { for (const n of comp){ n.x += shiftX-x0; n.y += -y0; } shiftX += x1-x0 + 6*U; }
+  }
+  if (perProject){ // each project's machines packed into a block under its name, the blocks packed onto the table
+    const byG = new Map(); for (const c of comps){ const g = c[0].g; (byG.get(g) || byG.set(g,[]).get(g)).push(c); }
+    const blocks = [];
+    for (const [g,cs] of byG){ const boxes = cs.map(c=>({c, w:c.box.w, h:c.box.h}));
+      const area = boxes.reduce((s,b)=>s+b.w*b.h, 0);
+      const [bw,bh] = shelf(boxes, 4*U, Math.max(boxes[0].w, Math.sqrt(area)*1.4));
+      blocks.push({g, boxes, w:Math.max(bw, DATA.groups[g].label.length*2.6*U), h:bh + 8*U}); }   // room for the name
+    blocks.sort((a,b)=>b.w*b.h-a.w*a.h);
+    const total = blocks.reduce((s,b)=>s+b.w*b.h, 0);
+    shelf(blocks, 16*U, Math.max(blocks[0].w, Math.sqrt(total)*1.6));
+    for (const bl of blocks){ labels.push({g:bl.g, x:bl.px, y:bl.py + 5*U, w:bl.w});
+      for (const b of bl.boxes){ const dx = bl.px + b.px - b.c.box.x0, dy = bl.py + 8*U + b.py - b.c.box.y0;
+        for (const n of b.c){ n.x += dx; n.y += dy; } } } }
+  // gear speeds and tooth phases, parent before child
+  const order = linked.filter(n=>n.part==='gear').sort((a,b)=>treeDepth(a)-treeDepth(b));
+  for (const n of order){ const p = n.tp;
+    if (p && meshed.has(key(n.i,p.i))){ const th = Math.atan2(n.y-p.y, n.x-p.x);
+      n.w = -p.w*p.T/n.T; n.ph = -p.ph*p.T/n.T + th*p.T/n.T + th + Math.PI - Math.PI/n.T; }
+    else { n.w = n.dir*0.00035*24/n.T; n.ph = 0; } }   // a gear on an axle drives its own little train
+  // trains: gears joined by meshes turn together, so cranking one turns the rest
+  for (const n of linked) n.train = null;
+  for (const s of linked){ if (s.part!=='gear' || s.train) continue; const tr = [s]; s.train = tr;
+    for (let k=0;k<tr.length;k++) for (const j of tr[k].tnb) if (!N[j].train && meshed.has(key(j,tr[k].i))){ N[j].train = tr; tr.push(N[j]); } }
+  return { tree, meshed, labels, nodes: linked.map(n=>[n.x,n.y,n.tp,n.tnb,n.out,n.w,n.ph,n.train]) };
+}
+function treeDepth(n){ let d = 0; while (n.tp){ n = n.tp; d++; } return d; }
+function useBuild(b){ tree = b.tree; meshed = b.meshed; labels = b.labels;
+  linked.forEach((n,k)=>{ [n.x,n.y,n.tp,n.tnb,n.out,n.w,n.ph,n.train] = b.nodes[k]; n.ck = 0; }); }
+const BUILDS = { projects: machineLayout(true), machine: machineLayout(false) };
+for (const n of N) n.ck = 0;   // hand-crank offset, radians
+function initWeb(){ // force layout start: a sunflower spiral
+  const R = Math.sqrt(linked.length)*40;
+  linked.forEach((n,k)=>{ const a = k*2.39996, r = R*Math.sqrt((k+.5)/linked.length);
+    n.x = Math.cos(a)*r; n.y = Math.sin(a)*r; n.vx = n.vy = 0; }); }
+// ---- web layout (smooth-cutoff grid repulsion + springs + gravity) ----
+let alpha = 0;
+function tick(){
+  const CELL = 150, grid = new Map();
+  for (const n of linked){ const k = Math.floor(n.x/CELL)+','+Math.floor(n.y/CELL);
+    (grid.get(k)||grid.set(k,[]).get(k)).push(n); }
+  for (const n of linked){
+    const cx = Math.floor(n.x/CELL), cy = Math.floor(n.y/CELL);
+    for (let dx=-1; dx<=1; dx++) for (let dy=-1; dy<=1; dy++){
+      const cell = grid.get((cx+dx)+','+(cy+dy)); if (!cell) continue;
+      for (const m of cell){ if (m.i<=n.i) continue;
+        let ex = n.x-m.x, ey = n.y-m.y, d2 = ex*ex+ey*ey;
+        if (d2 < 1e-4){ ex = Math.random()-.5; ey = Math.random()-.5; d2 = .5; }
+        if (d2 >= CELL*CELL) continue;
+        const d = Math.sqrt(d2), min = n.r+m.r+6;
+        let f = 400*(1/d2 - 1/(CELL*CELL));    // repulsion that fades to zero at CELL
+        if (d < min) f += (min-d)/d*0.5;       // collision: parts don't overlap
+        n.vx += ex*f; n.vy += ey*f; m.vx -= ex*f; m.vy -= ey*f; } }
+  }
+  for (const [a,b] of DATA.edges){ const n = N[a], m = N[b];
+    const ex = m.x-n.x, ey = m.y-n.y, d = Math.hypot(ex,ey)||1, L = 30+n.r+m.r;
+    const f = (d-L)/d*0.04; n.vx += ex*f; n.vy += ey*f; m.vx -= ex*f; m.vy -= ey*f; }
+  for (const n of linked){ n.vx -= n.x*0.006; n.vy -= n.y*0.006;
+    n.x += n.vx*alpha; n.y += n.vy*alpha; n.vx *= .55; n.vy *= .55; }
+  alpha = Math.max(0, alpha-0.0035);
+}
+function layoutLoose(){ // neat parts bin under the graph
+  let maxY = -Infinity, minX = Infinity, maxX = -Infinity;
+  for (const n of linked){ maxY = Math.max(maxY,n.y+n.r); minX = Math.min(minX,n.x); maxX = Math.max(maxX,n.x); }
+  const dx = mode==='gears' ? U*2.6 : U*1.6, dy = mode==='gears' ? U*1.4 : U*1.6;
+  const per = Math.max(10, Math.floor((maxX-minX)/dx));
+  const sorted = [...loose].sort((a,b)=>a.g.localeCompare(b.g)||a.t.localeCompare(b.t));
+  sorted.forEach((n,k)=>{ n.x = minX + (k%per)*dx; n.y = maxY + 80 + Math.floor(k/per)*dy; });
+}
+
+// ---- camera ----
+let cam = {x:0, y:0, s:1};
+function fit(){ const vis = visible(); if (!vis.length) return;
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+  for (const n of vis){ x0=Math.min(x0,n.x-n.r); y0=Math.min(y0,n.y-n.r); x1=Math.max(x1,n.x+n.r); y1=Math.max(y1,n.y+n.r); }
+  if (layout==='projects') for (const L of labels) if (groupOn[L.g]){ x0=Math.min(x0,L.x); y0=Math.min(y0,L.y-5*U); x1=Math.max(x1,L.x+L.w); }
+  const padL = panel.classList.contains('min') ? 20 : 280;
+  cam.s = Math.min((W-padL-40)/(x1-x0+20), (H-40)/(y1-y0+20));
+  cam.x = (x0+x1)/2 - (padL/2)/cam.s; cam.y = (y0+y1)/2; }
+const toScreen = (x,y)=>[(x-cam.x)*cam.s+W/2, (y-cam.y)*cam.s+H/2];
+const toWorld = (sx,sy)=>[(sx-W/2)/cam.s+cam.x, (sy-H/2)/cam.s+cam.y];
+
+// ---- drawing helpers ----
+function shade(hex, amt){ const v = parseInt(hex.slice(1),16);
+  const c = [v>>16, v>>8&255, v&255].map(x=>Math.max(0,Math.min(255,Math.round(x+amt))));
+  return `rgb(${c})`; }
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function circle(x,y,r){ ctx.beginPath(); ctx.arc(x,y,r,0,TAU); }
+const HOLE = '#0d0e0f';
+function onScreen(cx,cy,r){ return !(cx+r < 0 || cx-r > W || cy+r < 0 || cy-r > H); }
+
+// ---- classic brick ----
+function brick(n){
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), w = n.w*s, h = n.h*s, x = cx-w/2, y = cy-h/2;
+  if (!onScreen(cx,cy,Math.max(w,h))) return;
+  const base = n.color, u = U*s, depth = Math.max(1, u*0.18);
+  if (w < 2.5){ ctx.fillStyle = base; ctx.fillRect(x,y,Math.max(w,1),Math.max(h,1)); return; }
+  ctx.fillStyle = shade(base,-70);
+  if (n.round){ circle(cx+depth*.6, cy+depth, w/2); ctx.fill(); } else { rr(x+depth*.6, y+depth, w, h, u*.12); ctx.fill(); }
+  ctx.fillStyle = base;
+  if (n.round){ circle(cx, cy, w/2); ctx.fill(); } else { rr(x, y, w, h, u*.12); ctx.fill(); }
+  ctx.strokeStyle = shade(base,-45); ctx.lineWidth = Math.max(.5, u*.04); ctx.stroke();
+  if (u >= 5){
+    for (let c=0;c<n.cols;c++) for (let r=0;r<n.rows;r++){
+      const sx = x+(c+.5)*u, sy = y+(r+.5)*u, sr = u*.3;
+      ctx.fillStyle = shade(base,-40); circle(sx+sr*.18, sy+sr*.22, sr); ctx.fill();
+      ctx.fillStyle = shade(base,12); circle(sx, sy, sr); ctx.fill();
+      if (u >= 14){ ctx.fillStyle = 'rgba(255,255,255,.35)'; circle(sx-sr*.35, sy-sr*.35, sr*.28); ctx.fill(); }
+    } }
+}
+
+// ---- machine parts ----
+function axleCross(r, rot){ // cross-shaped axle hole, r = half-length in screen px
+  ctx.save(); ctx.rotate(rot); ctx.fillStyle = HOLE;
+  const t = r*0.36; ctx.fillRect(-r,-t/2,2*r,t); ctx.fillRect(-t/2,-r,t,2*r); ctx.restore(); }
+function gearPath(Rp, T, rot, s){
+  const ro = Rp + 0.19*U*s, rt = Rp - 0.23*U*s, p = TAU/T;   // tip clears the mating gear's root
+  ctx.beginPath(); let first = true;
+  for (let i=0;i<T;i++){ const a = rot + i*p;
+    const pts = [[rt,a-.5*p],[rt,a-.3*p],[ro,a-.14*p],[ro,a+.14*p],[rt,a+.3*p]];
+    for (const [r,ang] of pts){ const X = Math.cos(ang)*r, Y = Math.sin(ang)*r;
+      if (first){ ctx.moveTo(X,Y); first = false; } else ctx.lineTo(X,Y); } }
+  ctx.closePath(); }
+function gear(n, t){
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), Rp = n.R*s, base = n.color;
+  if (!onScreen(cx,cy,Rp+U*s)) return;
+  if (Rp < 3){ ctx.fillStyle = base; circle(cx,cy,Math.max(Rp,1)); ctx.fill(); return; }
+  const rot = (spin ? n.w*t : 0) + n.ph + n.ck, depth = Math.max(1, U*s*0.2);
+  ctx.save(); ctx.translate(cx+depth*.6, cy+depth); gearPath(Rp, n.T, rot, s); ctx.fillStyle = shade(base,-75); ctx.fill(); ctx.restore();
+  ctx.save(); ctx.translate(cx, cy);
+  gearPath(Rp, n.T, rot, s); ctx.fillStyle = base; ctx.fill();
+  ctx.strokeStyle = shade(base,-50); ctx.lineWidth = Math.max(.5, U*s*.04); ctx.stroke();
+  if (Rp >= 8){
+    ctx.fillStyle = shade(base,-22); circle(0,0,Rp*0.74); ctx.fill();          // recessed web
+    const holes = n.T>=64 ? 8 : n.T>=40 ? 6 : n.T>=24 ? 4 : 0;                 // lightening holes
+    for (let k=0;k<holes;k++){ const a = rot + k*TAU/holes + TAU/holes/2;
+      const hx = Math.cos(a)*Rp*.52, hy = Math.sin(a)*Rp*.52, hr = Rp*({8:.1,6:.12,4:.15}[holes]);
+      ctx.fillStyle = shade(base,-55); circle(hx,hy,hr*1.18); ctx.fill();
+      ctx.fillStyle = HOLE; circle(hx,hy,hr); ctx.fill(); }
+    ctx.fillStyle = base; circle(0,0,Math.max(Rp*.3, U*s*.55)); ctx.fill();   // hub
+    ctx.strokeStyle = shade(base,-45); ctx.stroke();
+    axleCross(U*s*.26, rot);
+    if (Rp >= 20){ ctx.fillStyle = 'rgba(255,255,255,.18)'; circle(-Rp*.35,-Rp*.35,Rp*.12); ctx.fill(); }
+  }
+  ctx.restore();
+}
+function beamAngle(n){ // point the beam along its links
+  let sx = 0, sy = 0;
+  for (const j of n.nb){ const m = N[j], dx = m.x-n.x, dy = m.y-n.y, d = Math.hypot(dx,dy)||1;
+    // fold opposite directions together so a beam between two parts lines up with both
+    let a = Math.atan2(dy,dx)*2; sx += Math.cos(a); sy += Math.sin(a); }
+  return Math.atan2(sy,sx)/2; }
+function beam(n){
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), L = n.holes*U*s, w = U*s, base = n.color;
+  if (!onScreen(cx,cy,L)) return;
+  n.ang = beamAngle(n);
+  const depth = Math.max(1, w*0.2);
+  if (w < 2){ ctx.save(); ctx.translate(cx,cy); ctx.rotate(n.ang); ctx.fillStyle = base;
+    ctx.fillRect(-L/2,-Math.max(w,1)/2,L,Math.max(w,1)); ctx.restore(); return; }
+  ctx.save(); ctx.translate(cx+depth*.6, cy+depth); ctx.rotate(n.ang);
+  rr(-L/2,-w/2,L,w,w/2); ctx.fillStyle = shade(base,-75); ctx.fill(); ctx.restore();
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(n.ang);
+  rr(-L/2,-w/2,L,w,w/2); ctx.fillStyle = base; ctx.fill();
+  ctx.strokeStyle = shade(base,-50); ctx.lineWidth = Math.max(.5, w*.05); ctx.stroke();
+  if (w >= 5){
+    for (let k=0;k<n.holes;k++){ const hx = (-(n.holes-1)/2 + k)*w;
+      ctx.fillStyle = shade(base,-45); circle(hx, 0, w*.36); ctx.fill();
+      if (k===0 || k===n.holes-1){ ctx.fillStyle = base; circle(hx,0,w*.3); ctx.fill(); ctx.save(); ctx.translate(hx,0); axleCross(w*.26, 0); ctx.restore(); }
+      else { ctx.fillStyle = HOLE; circle(hx, 0, w*.3); ctx.fill(); } }
+    ctx.fillStyle = 'rgba(255,255,255,.12)'; rr(-L/2+w*.2,-w*.42,L-w*.4,w*.18,w*.09); ctx.fill();
+  }
+  ctx.restore();
+}
+function pin(n){
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), L = 2*U*s, w = 0.62*U*s, base = n.color;
+  if (!onScreen(cx,cy,L)) return;
+  if (w < 1.5){ ctx.fillStyle = base; ctx.fillRect(cx-L/2, cy-.5, Math.max(L,1), 1); return; }
+  ctx.fillStyle = shade(base,-70); rr(cx-L/2+w*.12, cy-w/2+w*.2, L, w, w/2); ctx.fill();
+  ctx.fillStyle = base; rr(cx-L/2, cy-w/2, L, w, w/2); ctx.fill();
+  ctx.fillStyle = shade(base,-35); ctx.fillRect(cx-w*.3, cy-w*.68, w*.6, w*1.36);         // collar
+  ctx.fillStyle = 'rgba(255,255,255,.2)'; ctx.fillRect(cx-L/2+w*.4, cy-w*.3, L-w*.8, w*.14);
+}
+// angle helpers for parts that line their arms up with their links
+const angTo = (n,m)=>Math.atan2(m.y-n.y, m.x-n.x);
+function armNbs(n){ // the links a part's arms should face: in machine mode, the axles actually drawn
+  if (layout==='web' || !n.tnb.length) return n.nb;
+  return n.tnb.length >= 2 ? n.tnb : [...n.tnb, ...n.nb.filter(j=>!n.tnb.includes(j))]; }
+const angDist = (a,b)=>{ const d = Math.abs(((a-b)%TAU+TAU)%TAU); return Math.min(d, TAU-d); };
+const CONN = [ // angled axle connectors: [angle between arms in degrees]
+  [90], [112.5], [135], [157.5], [180]];
+function connPose(n){ // snap to the closest real connector, arms symmetric about the links' bisector
+  const nb = armNbs(n), a1 = angTo(n,N[nb[0]]), a2 = angTo(n,N[nb[1]]);
+  const sx = Math.cos(a1)+Math.cos(a2), sy = Math.sin(a1)+Math.sin(a2);
+  const between = angDist(a1,a2)*180/Math.PI;
+  let best = CONN[0]; for (const c of CONN) if (Math.abs(c[0]-between) < Math.abs(best[0]-between)) best = c;
+  const bis = Math.hypot(sx,sy) < 0.2 ? a1 + Math.PI/2 : Math.atan2(sy,sx), half = best[0]*Math.PI/360;
+  n.conn = best; return [bis-half, bis+half]; }
+const TEE_ARMS = [0, Math.PI, Math.PI/2];                             // bar left/right, stem "down"
+const TEE_HOLES = [[-1,0],[0,0],[1,0],[0,1],[0,2]];                   // hole centres in studs
+function bestAngle(n, arms){ // rotation that best lines a part's arms up with its links
+  const dirs = armNbs(n).map(j=>angTo(n,N[j])); let best = 0, bc = Infinity;
+  for (let k=0;k<72;k++){ const r = k*TAU/72; let c = 0;
+    for (const d of dirs) c += Math.min(...arms.map(a=>angDist(d, a+r)));
+    if (c < bc){ bc = c; best = r; } }
+  return best; }
+const teeAngle = n=>bestAngle(n, TEE_ARMS);
+function shadowed(cx, cy, depth, ang, path, base){ // draw a flat part: drop shadow, body, outline
+  ctx.save(); ctx.translate(cx+depth*.6, cy+depth); ctx.rotate(ang); path(); ctx.fillStyle = shade(base,-75); ctx.fill('evenodd'); ctx.restore();
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang); path(); ctx.fillStyle = base; ctx.fill('evenodd');
+  ctx.strokeStyle = shade(base,-50); ctx.lineWidth = Math.max(.5, U*cam.s*.05); ctx.stroke(); }
+function hole(x, y, w, base, axleHole){
+  ctx.fillStyle = shade(base,-45); circle(x, y, w*.36); ctx.fill();
+  if (axleHole){ ctx.fillStyle = base; circle(x,y,w*.3); ctx.fill(); ctx.save(); ctx.translate(x,y); axleCross(w*.26,0); ctx.restore(); }
+  else { ctx.fillStyle = HOLE; circle(x, y, w*.3); ctx.fill(); } }
+function conn(n){ // angled connector: round pin hub, two arms ending in axle holes
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), w = U*s, base = n.color;
+  if (!onScreen(cx,cy,2*w)) return;
+  const arms = connPose(n);
+  if (w < 3){ ctx.fillStyle = base; circle(cx,cy,Math.max(w*.8,1)); ctx.fill(); return; }
+  const path = ()=>{ ctx.beginPath();
+    for (const a of arms){ const ex = Math.cos(a)*w*1.1, ey = Math.sin(a)*w*1.1, px = -Math.sin(a)*w*.36, py = Math.cos(a)*w*.36;
+      ctx.moveTo(px,py); ctx.lineTo(ex+px,ey+py); ctx.arc(ex,ey,w*.36,a+Math.PI/2,a-Math.PI/2,true); ctx.lineTo(-px,-py); ctx.closePath(); }
+    ctx.moveTo(w*.5,0); ctx.arc(0,0,w*.5,0,TAU); };
+  const depth = Math.max(1, w*.2);
+  ctx.save(); ctx.translate(cx+depth*.6, cy+depth); path(); ctx.fillStyle = shade(base,-75); ctx.fill('nonzero'); ctx.restore();
+  ctx.save(); ctx.translate(cx,cy); path(); ctx.fillStyle = base; ctx.fill('nonzero');
+  if (w >= 5){ for (const a of arms) hole(Math.cos(a)*w*1.1, Math.sin(a)*w*1.1, w, base, true);
+    hole(0, 0, w*1.2, base, false); }
+  ctx.restore(); }
+function tee(n){ // T-shaped beam 3x3
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), w = U*s, base = n.color;
+  if (!onScreen(cx,cy,3*w)) return;
+  n.ang = teeAngle(n);
+  if (w < 2){ ctx.save(); ctx.translate(cx,cy); ctx.rotate(n.ang); ctx.fillStyle = base; ctx.fillRect(-1.5*w,-w/2,3*w,w); ctx.fillRect(-w/2,0,w,2.5*w); ctx.restore(); return; }
+  const depth = Math.max(1, w*.2), body = ()=>{ // union of bar and stem, filled with nonzero so the overlap stays solid
+    ctx.beginPath(); ctx.moveTo(-w,-w/2); ctx.lineTo(w,-w/2); ctx.arc(w,0,w/2,-Math.PI/2,Math.PI/2); ctx.lineTo(w/2,w/2);
+    ctx.lineTo(w/2,2*w); ctx.arc(0,2*w,w/2,0,Math.PI); ctx.lineTo(-w/2,w/2); ctx.lineTo(-w,w/2);
+    ctx.arc(-w,0,w/2,Math.PI/2,-Math.PI/2); ctx.closePath(); };
+  shadowed(cx, cy, depth, n.ang, body, base);
+  if (w >= 5) TEE_HOLES.forEach(([hx,hy])=>hole(hx*w, hy*w, w, base, hx===0 && hy===0));
+  ctx.restore(); }
+const HUB_ARMS = [0, Math.PI/2, Math.PI, Math.PI*3/2];
+function hub(n){ // axle connector hub with 4 bars and pin hole, turned so the bars best match its links
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), w = U*s, base = n.color;
+  if (!onScreen(cx,cy,2*w)) return;
+  n.ang = bestAngle(n, HUB_ARMS);
+  if (w < 3){ ctx.fillStyle = base; circle(cx,cy,Math.max(w*.7,1)); ctx.fill(); return; }
+  const body = ()=>{ ctx.beginPath();
+    for (const a of HUB_ARMS){ ctx.save(); ctx.rotate(a); const r = 0.16*w;               // round 3.2mm bars, added to one path
+      ctx.moveTo(0.3*w, -r); ctx.lineTo(1.5*w-r, -r); ctx.arc(1.5*w-r, 0, r, -Math.PI/2, Math.PI/2); ctx.lineTo(0.3*w, r); ctx.closePath(); ctx.restore(); }
+    ctx.moveTo(0.6*w,0); ctx.arc(0,0,0.6*w,0,TAU); };
+  const depth = Math.max(1, w*.2);
+  ctx.save(); ctx.translate(cx+depth*.6, cy+depth); ctx.rotate(n.ang); body(); ctx.fillStyle = shade(base,-75); ctx.fill('nonzero'); ctx.restore();
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(n.ang); body(); ctx.fillStyle = base; ctx.fill('nonzero');
+  if (w >= 5){ for (const a of HUB_ARMS){ ctx.fillStyle = 'rgba(255,255,255,.18)';                     // highlight along each bar
+      ctx.save(); ctx.rotate(a); ctx.fillRect(0.65*w,-0.1*w,0.8*w,0.06*w); ctx.restore(); }
+    hole(0, 0, w*1.4, base, false); }
+  ctx.restore(); }
+function turn(n, t){ // 6x6 turntable: grey square base, round top in the note's colour
+  const s = cam.s, [cx,cy] = toScreen(n.x,n.y), w = U*s, base = n.color, depth = Math.max(1, w*.2);
+  if (!onScreen(cx,cy,4.3*w)) return;
+  if (w < 2){ ctx.fillStyle = base; ctx.fillRect(cx-3*w,cy-3*w,Math.max(6*w,1),Math.max(6*w,1)); return; }
+  ctx.fillStyle = '#3b3e40'; rr(cx-3*w+depth*.6, cy-3*w+depth, 6*w, 6*w, w*.3); ctx.fill();
+  ctx.fillStyle = '#a0a5a9'; rr(cx-3*w, cy-3*w, 6*w, 6*w, w*.3); ctx.fill();
+  ctx.strokeStyle = '#6c6e68'; ctx.lineWidth = Math.max(.5, w*.05); ctx.stroke();
+  const rot = spin ? t*0.00012 : 0;
+  ctx.fillStyle = shade(base,-70); circle(cx+depth*.4, cy+depth*.6, 2.8*w); ctx.fill();
+  ctx.fillStyle = base; circle(cx, cy, 2.8*w); ctx.fill(); ctx.strokeStyle = shade(base,-50); ctx.stroke();
+  if (w >= 5){ ctx.strokeStyle = shade(base,-30); ctx.lineWidth = w*.08; circle(cx,cy,2.2*w); ctx.stroke();
+    for (let k=0;k<4;k++){ const a = rot + k*TAU/4 + TAU/8, sx = cx+Math.cos(a)*1.5*w, sy = cy+Math.sin(a)*1.5*w, sr = w*.3;
+      ctx.fillStyle = shade(base,-40); circle(sx+sr*.18, sy+sr*.22, sr); ctx.fill();
+      ctx.fillStyle = shade(base,12); circle(sx, sy, sr); ctx.fill(); }
+    ctx.save(); ctx.translate(cx,cy); hole(0,0,w*1.3,base,true); ctx.restore(); } }
+function axleLine(x1,y1,x2,y2,lw,hot){
+  ctx.strokeStyle = hot ? '#f2cd37' : '#a0a5a9'; ctx.lineWidth = lw;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.strokeStyle = hot ? '#b8921c' : '#6c6e68'; ctx.lineWidth = Math.max(.6, lw*.28); ctx.stroke(); } // cross-profile groove
+function axle(a, b, state){ // a link drawn as a grey axle; a link across groups gets a universal joint
+  const [x1,y1] = toScreen(a.x,a.y), [x2,y2] = toScreen(b.x,b.y), lw = 0.34*U*cam.s, hot = state==='hot';
+  const op = hot ? 1 : state==='dim' ? .07 : .55, cross = a.g !== b.g;
+  let mx = (x1+x2)/2, my = (y1+y2)/2;
+  if (cross){ // bend the axle at the joint so it reads as a knee, not a straight rod
+    const dx = x2-x1, dy = y2-y1, L = Math.hypot(dx,dy)||1, k = Math.min(0.12*L, 3*U*cam.s) * ((a.i+b.i)%2 ? 1 : -1);
+    mx += -dy/L*k; my += dx/L*k; }
+  if (lw < 1.4){ ctx.strokeStyle = hot ? '#f2cd37' : `rgba(170,175,180,${op*.45})`;
+    ctx.lineWidth = hot ? 1.5 : 1; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(mx,my); ctx.lineTo(x2,y2); ctx.stroke(); return; }
+  ctx.lineCap = 'butt'; ctx.globalAlpha = op;
+  if (!cross){ axleLine(x1,y1,x2,y2,lw,hot); ctx.globalAlpha = 1; return; }
+  axleLine(x1,y1,mx,my,lw,hot); axleLine(mx,my,x2,y2,lw,hot);
+  // universal joint: a yoke on each half, a cross-shaped spider in the middle
+  const w = U*cam.s, body = hot ? '#f2cd37' : '#c8cccf', edge = hot ? '#b8921c' : '#5a5c58';
+  if (state !== 'dim') ctx.globalAlpha = Math.min(1, op + .4);           // the joint reads over the axles
+  for (const [ex,ey] of [[x1,y1],[x2,y2]]){ const a2 = Math.atan2(ey-my, ex-mx);
+    ctx.save(); ctx.translate(mx,my); ctx.rotate(a2);
+    ctx.fillStyle = body; rr(0.2*w,-0.55*w,1.6*w,1.1*w,0.28*w); ctx.fill(); ctx.strokeStyle = edge; ctx.lineWidth = Math.max(.5,w*.06); ctx.stroke();
+    ctx.fillStyle = HOLE; ctx.fillRect(0.2*w,-0.16*w,0.6*w,0.32*w);         // slot between the fork tines
+    ctx.restore(); }
+  ctx.fillStyle = edge; circle(mx,my,0.5*w); ctx.fill(); ctx.fillStyle = body; circle(mx,my,0.36*w); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+function band(a, b, state){ // a link outside the gear train: a rubber band, slightly slack
+  const [x1,y1] = toScreen(a.x,a.y), [x2,y2] = toScreen(b.x,b.y), dx = x2-x1, dy = y2-y1, L = Math.hypot(dx,dy)||1;
+  const sag = Math.min(0.1*L, 40) * ((a.i+b.i)%2 ? 1 : -1), mx = (x1+x2)/2 - dy/L*sag, my = (y1+y2)/2 + dx/L*sag;
+  ctx.strokeStyle = state==='hot' ? '#f2cd37' : state==='dim' ? 'rgba(201,26,9,.06)' : 'rgba(201,26,9,.32)';
+  ctx.lineWidth = state==='hot' ? 2 : Math.max(1, 0.12*U*cam.s);
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.quadraticCurveTo(mx,my,x2,y2); ctx.stroke(); }
+function partName(n){ // what the part is, for the tooltip
+  if (n.part==='gear') return `${n.T}-tooth gear`;
+  if (n.part==='conn'){ const c = n.conn || (connPose(n), n.conn); return `Angled connector (${c[0]}°)`; }
+  return { beam:'Beam, 3 holes', tee:'T-beam 3×3', hub:'Hub with 4 bars', turn:'Turntable', pin:'Pin' }[n.part]; }
+
+// ---- frame ----
+function visible(){ return N.filter(n=>groupOn[n.g] && (n.deg>0 || showLoose)); }
+function matches(n){ return !query || n.t.toLowerCase().includes(query) || n.p.toLowerCase().includes(query); }
+function draw(t){
+  if (!W) return;
+  ctx.setTransform(DPR,0,0,DPR,0,0); ctx.fillStyle = '#17191b'; ctx.fillRect(0,0,W,H);
+  const vis = visible(), on = new Set(vis.map(n=>n.i));
+  const focus = hover ? new Set([hover.i, ...hover.nb]) : null;
+  if (layout==='projects'){ ctx.textAlign = 'left'; ctx.font = `600 ${Math.max(11, Math.min(40, 4*U*cam.s))}px -apple-system, sans-serif`;
+    for (const L of labels){ if (!groupOn[L.g]) continue; const [sx,sy] = toScreen(L.x,L.y);
+      ctx.fillStyle = DATA.groups[L.g].color; ctx.fillText(DATA.groups[L.g].label, sx, sy, Math.max(20, L.w*cam.s)); } }
+  for (const [a,b] of DATA.edges){ if (!on.has(a)||!on.has(b)) continue;
+    const hot = focus && (a===hover.i || b===hover.i), dim = (focus && !hot) || (query && !(matches(N[a]) && matches(N[b])));
+    if (layout!=='web'){ const k = key(a,b);
+      if (meshed.has(k)) continue;                                   // meshing teeth are the link
+      if (!tree.has(k)){ if (hot || showAll) band(N[a], N[b], hot ? 'hot' : dim ? 'dim' : ''); continue; } }
+    if (mode==='gears') axle(N[a], N[b], hot ? 'hot' : dim ? 'dim' : '');
+    else { ctx.lineWidth = 1; ctx.strokeStyle = hot ? 'rgba(255,255,255,.7)' : dim ? 'rgba(255,255,255,.04)' : 'rgba(255,255,255,.10)';
+      const [x1,y1] = toScreen(N[a].x,N[a].y), [x2,y2] = toScreen(N[b].x,N[b].y);
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); } }
+  const order = [...vis].sort((a,b)=>a.deg-b.deg);   // small first so hubs sit on top
+  for (const n of order){
+    ctx.globalAlpha = ((focus && !focus.has(n.i)) || (query && !matches(n))) ? 0.12 : 1;
+    if (mode==='bricks') brick(n);
+    else ({ gear:()=>gear(n,t), beam:()=>beam(n), conn:()=>conn(n), tee:()=>tee(n), hub:()=>hub(n), turn:()=>turn(n,t), pin:()=>pin(n) })[n.part]();
+  }
+  ctx.globalAlpha = 1;
+  ctx.font = '12px -apple-system, sans-serif'; ctx.textAlign = 'center';
+  for (const n of order){
+    const show = (n===hover) || (query && matches(n)) || (cam.s > 1.3 && n.deg >= 4) || (cam.s > 2.5);
+    if (!show || (focus && !focus.has(n.i))) continue;
+    const [sx,sy] = toScreen(n.x,n.y); if (sx<-100||sx>W+100||sy<-20||sy>H+60) continue;
+    const off = mode==='bricks' ? n.h/2 : n.part==='beam' ? U*.8 : n.part==='pin' ? U*.5 : n.tr;
+    const t2 = n.t.length > 38 ? n.t.slice(0,36)+'…' : n.t, y = sy + off*cam.s + 14;
+    ctx.fillStyle = 'rgba(0,0,0,.65)'; const tw = ctx.measureText(t2).width;
+    ctx.fillRect(sx-tw/2-3, y-11, tw+6, 15); ctx.fillStyle = '#eee'; ctx.fillText(t2, sx, y); }
+}
+// One animation loop: runs while the layout settles or gears are spinning, otherwise idles.
+let running = false;
+function frame(t){
+  if (layout==='web' && alpha > 0){ for (let i=0;i<3;i++) tick(); if (alpha > 0.6) fit(); if (alpha === 0) fit(); }
+  draw(t);
+  if ((layout==='web' && alpha > 0) || (mode==='gears' && spin)) requestAnimationFrame(frame); else running = false;
+}
+function kick(){ if (!running){ running = true; requestAnimationFrame(frame); } }
+
+// ---- panel ----
+const panel = document.getElementById('panel');
+if (innerWidth < 700) panel.classList.add('min');
+panel.querySelector('h1').onclick = ()=>panel.classList.toggle('min');
+const legend = document.getElementById('legend');
+const counts = {}; for (const n of N) counts[n.g] = (counts[n.g]||0)+1;
+for (const [k,g] of Object.entries(DATA.groups)){ if (!counts[k]) continue;
+  const row = document.createElement('div'); row.className = 'row';
+  const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = g.color;
+  const lb = document.createElement('span'); lb.textContent = g.label;
+  const ct = document.createElement('span'); ct.className = 'n'; ct.textContent = counts[k];
+  row.append(sw, lb, ct);
+  row.onclick = ()=>{ groupOn[k] = !groupOn[k]; row.classList.toggle('off', !groupOn[k]); kick(); };
+  legend.append(row); }
+function updateStats(){ document.getElementById('stats').textContent =
+  `${N.length} notes · ${DATA.edges.length} links · ${loose.length} unlinked` + (layout==='web' ? '' : ` · ${meshed.size} gear meshes`); }
+const SIZES = {
+  gears: 'Part = link count:<br>64-tooth gear (40+) · 40T (20–39) · 24T (12–19) · 16T (6–11)<br>' +
+    '4-bar hub (4–5) · T-beam (3) · angled connector, snapped to the links\' angle (2) · 3-hole beam (1) · pin (none)<br>' +
+    'Index notes are turntables.<br>Links are axles; in Web and Machine, links between project groups get a universal joint.<br>' +
+    'Machine layout: gears linked to gears really mesh (one tree of them); every other part rides an axle. Links outside that tree are red rubber bands, shown on hover or with the checkbox.<br>' +
+    'By project: one machine per project group, side by side; links between projects are rubber bands.<br>Drag a gear to crank it: its whole train turns at the tooth ratios.',
+  bricks: 'Brick size = link count:<br>2×4 hub (12+) · 2×2 (4–11) · 1×2 (1–3) · round 1×1 (none)' };
+function setMode(m){ mode = m;
+  document.getElementById('mGears').classList.toggle('on', m==='gears');
+  document.getElementById('mBrick').classList.toggle('on', m==='bricks');
+  document.getElementById('sizes').innerHTML = SIZES[m];   // static strings above, no note data
+  document.getElementById('spinRow').style.display = m==='gears' ? '' : 'none';
+  document.getElementById('ttl').textContent = m==='gears' ? 'Gearbox Graph' : 'Brick Graph';
+  if (showLoose) layoutLoose(); kick(); }
+document.getElementById('mGears').onclick = ()=>setMode('gears');
+document.getElementById('mBrick').onclick = ()=>setMode('bricks');
+function setLayout(l){ layout = l;
+  for (const [id,v] of [['lMach','machine'],['lProj','projects'],['lWeb','web']]) document.getElementById(id).classList.toggle('on', l===v);
+  document.getElementById('allRow').style.display = l==='web' ? 'none' : '';
+  if (l==='web'){ initWeb(); alpha = 1; } else { useBuild(BUILDS[l]); alpha = 0; }
+  updateStats(); if (showLoose) layoutLoose(); fit(); kick(); }
+document.getElementById('lMach').onclick = ()=>setLayout('machine');
+document.getElementById('lProj').onclick = ()=>setLayout('projects');
+document.getElementById('lWeb').onclick = ()=>setLayout('web');
+document.getElementById('all').onchange = e=>{ showAll = e.target.checked; kick(); };
+document.getElementById('spin').onchange = e=>{ spin = e.target.checked; kick(); };
+document.getElementById('orph').onchange = e=>{ showLoose = e.target.checked; layoutLoose(); fit(); kick(); };
+document.getElementById('q').oninput = e=>{ query = e.target.value.trim().toLowerCase(); kick(); };
+
+// ---- interaction ----
+const tip = document.getElementById('tip');
+let drag = null, crank = null, moved = false;
+const openNote = n=>{ location.href = 'obsidian://open?vault='+encodeURIComponent(DATA.vault)+'&file='+encodeURIComponent(n.p.replace(/\.md$/,'')); };
+function hit(n, wx, wy){
+  const pad = 3/cam.s, dx = wx-n.x, dy = wy-n.y;
+  if (mode==='bricks') return Math.abs(dx) <= n.w/2+pad && Math.abs(dy) <= n.h/2+pad;
+  if (n.part==='gear') return Math.hypot(dx,dy) <= n.tr+pad;
+  if (n.part==='conn' || n.part==='hub') return Math.hypot(dx,dy) <= 1.5*U+pad;
+  if (n.part==='turn') return Math.abs(dx) <= 3*U+pad && Math.abs(dy) <= 3*U+pad;
+  const ang = n.part==='pin' ? 0 : (n.ang ?? (n.part==='tee' ? teeAngle(n) : beamAngle(n)));
+  const along = dx*Math.cos(ang)+dy*Math.sin(ang), across = -dx*Math.sin(ang)+dy*Math.cos(ang);
+  if (n.part==='tee') return TEE_HOLES.some(([hx,hy])=>Math.hypot(along-hx*U, across-hy*U) <= .65*U+pad);
+  const [L,Wd] = n.part==='beam' ? [n.holes*U,U] : [2*U,U];
+  return Math.abs(along) <= L/2+pad && Math.abs(across) <= Wd/2+pad; }
+function pick(sx,sy){ const [wx,wy] = toWorld(sx,sy); let best = null, bd = Infinity;
+  for (const n of visible()) if (hit(n,wx,wy)){ const d = Math.hypot(wx-n.x, wy-n.y); if (d<bd){ bd=d; best=n; } }
+  return best; }
+cv.onmousedown = e=>{ moved = false; cv.classList.add('dragging');
+  const g = mode==='gears' && layout!=='web' ? pick(e.clientX,e.clientY) : null;
+  if (g && g.part==='gear'){ const [wx,wy] = toWorld(e.clientX,e.clientY);   // grab a gear: crank it
+    crank = {g, a:Math.atan2(wy-g.y, wx-g.x), x:e.clientX, y:e.clientY}; return; }
+  drag = {x:e.clientX, y:e.clientY, cx:cam.x, cy:cam.y}; };
+addEventListener('mouseup', e=>{ cv.classList.remove('dragging');
+  if ((drag || crank) && !moved){ const n = pick(e.clientX,e.clientY); if (n) openNote(n); }
+  drag = null; crank = null; });
+addEventListener('mousemove', e=>{
+  if (crank){ if (Math.abs(e.clientX-crank.x)+Math.abs(e.clientY-crank.y) > 3) moved = true;
+    const g = crank.g, [wx,wy] = toWorld(e.clientX,e.clientY), a = Math.atan2(wy-g.y, wx-g.x);
+    const d = ((a-crank.a+Math.PI)%TAU+TAU)%TAU - Math.PI; crank.a = a;
+    for (const h of g.train) h.ck += d*h.w/g.w;   // meshed gears keep their phase relation: ratio = speed ratio
+    kick(); return; }
+  if (drag){ const dx = e.clientX-drag.x, dy = e.clientY-drag.y; if (Math.abs(dx)+Math.abs(dy) > 3) moved = true;
+    cam.x = drag.cx - dx/cam.s; cam.y = drag.cy - dy/cam.s; kick(); return; }
+  if (e.target !== cv) return;
+  const n = pick(e.clientX,e.clientY);
+  if (n !== hover){ hover = n; kick(); }
+  if (n){ tip.style.display = 'block';
+    tip.replaceChildren(Object.assign(document.createElement('b'),{textContent:n.t}),
+      Object.assign(document.createElement('span'),{textContent:`${DATA.groups[n.g].label} · ${n.deg} links`}),
+      document.createElement('br'),
+      ...(mode==='gears' ? [Object.assign(document.createElement('span'),{textContent:partName(n)}), document.createElement('br')] : []),
+      Object.assign(document.createElement('span'),{textContent:n.p}));
+    tip.style.left = Math.min(e.clientX+14, W-350)+'px'; tip.style.top = (e.clientY+14)+'px'; }
+  else tip.style.display = 'none';
+});
+cv.onmouseleave = ()=>{ hover = null; tip.style.display = 'none'; kick(); };
+cv.addEventListener('wheel', e=>{ e.preventDefault();
+  const [wx,wy] = toWorld(e.clientX,e.clientY), k = Math.exp(-e.deltaY*0.0015);
+  cam.s = Math.min(12, Math.max(0.05, cam.s*k));
+  cam.x = wx - (e.clientX-W/2)/cam.s; cam.y = wy - (e.clientY-H/2)/cam.s; kick(); }, {passive:false});
+addEventListener('resize', resize);
+
+// ---- go ----
+setMode('gears');
+resize(); setLayout('machine');
+</script>
+</body>
+</html>

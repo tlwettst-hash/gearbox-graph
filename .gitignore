@@ -1,0 +1,7 @@
+# Your graph and your vault's location stay on your computer.
+gearbox-graph.html
+.vault-path
+groups.json
+
+__pycache__/
+.DS_Store

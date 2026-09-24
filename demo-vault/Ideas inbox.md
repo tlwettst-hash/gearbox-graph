@@ -1,0 +1,3 @@
+# Ideas inbox
+
+Unsorted ideas.

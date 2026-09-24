@@ -1,0 +1,4 @@
+# Keep each launcher runnable on its own OS, whatever the cloner's line-ending settings.
+*.bat     text eol=crlf
+*.command text eol=lf
+*.py      text eol=lf

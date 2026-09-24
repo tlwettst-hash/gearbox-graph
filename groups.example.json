@@ -1,0 +1,21 @@
+{
+  "groups": {
+    "work":    {"label": "Work",            "color": "#C91A09"},
+    "garden":  {"label": "Garden & kitchen", "color": "#237841"},
+    "shop":    {"label": "Workshop",        "color": "#F2CD37"},
+    "journal": {"label": "Journal",         "color": "#F4F4F4"},
+    "other":   {"label": "Everything else", "color": "#A0A5A9"}
+  },
+  "folders": {
+    "Work": "work",
+    "Garden": "garden",
+    "Kitchen": "garden",
+    "Workshop": "shop",
+    "Journal": "journal"
+  },
+  "tags": {
+    "garden": "garden"
+  },
+  "folders_win": ["Journal"],
+  "fallback": "other"
+}
